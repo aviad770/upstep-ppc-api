@@ -17,35 +17,52 @@ app.get('/health', (req, res) => {
   res.json({ status: 'online', timestamp: new Date().toISOString() });
 });
 
+// פונקציית עזר לניקוי והדפסה בטוחה של מפתחות לדיבאג
+const debugKey = (key) => {
+  if (!key) return "MISSING";
+  const s = key.toString().trim();
+  if (s.length < 8) return `Too Short (${s.length})`;
+  return `${s.substring(0, 4)}...${s.substring(s.length - 4)} (Len: ${s.length})`;
+};
+
 const platformHandlers = {
   google: async (creds, body) => {
     const { action, accountId, campaignId, status: newStatus, loginCustomerId } = body;
     
-    console.log(`[Google Ads] Action: ${action} | Account: ${accountId} | LoginCID: ${loginCustomerId || 'None'}`);
+    // ניקוי רווחים מכל השדות
+    const cleanAccountId = accountId.toString().trim().replace(/-/g, '');
+    const cleanLoginId = loginCustomerId ? loginCustomerId.toString().trim().replace(/-/g, '') : undefined;
+    const cleanDevToken = creds.developerToken.trim();
+    const cleanRToken = creds.refreshToken.trim();
+    const cleanCId = (creds.clientId || process.env.GOOGLE_CLIENT_ID || "").trim();
+    const cleanCSecret = (creds.clientSecret || process.env.GOOGLE_CLIENT_SECRET || "").trim();
 
-    const finalClientId = creds.clientId || process.env.GOOGLE_CLIENT_ID;
-    const finalClientSecret = creds.clientSecret || process.env.GOOGLE_CLIENT_SECRET;
+    console.log(`[Google Ads] Diagnostic Check:`);
+    console.log(`- Action: ${action}`);
+    console.log(`- Account ID: ${cleanAccountId}`);
+    console.log(`- Login CID (MCC): ${cleanLoginId || 'None'}`);
+    console.log(`- Client ID: ${debugKey(cleanCId)}`);
+    console.log(`- Client Secret: ${debugKey(cleanCSecret)}`);
+    console.log(`- Refresh Token: ${debugKey(cleanRToken)}`);
 
-    if (!finalClientId || !finalClientSecret || !creds.developerToken || !creds.refreshToken) {
-      throw new Error("Missing required credentials (ClientID, Secret, DevToken, or RefreshToken)");
+    if (!cleanCId || !cleanCSecret) {
+      throw new Error("Missing Client ID or Client Secret");
     }
 
-    // יצירת הקליינט עם תמיכה ב-Login Customer ID (קריטי לחשבונות MCC)
-    const client = new GoogleAdsApi({
-      client_id: finalClientId,
-      client_secret: finalClientSecret,
-      developer_token: creds.developerToken,
-    });
+    try {
+      const client = new GoogleAdsApi({
+        client_id: cleanCId,
+        client_secret: cleanCSecret,
+        developer_token: cleanDevToken,
+      });
 
-    const customer = client.Customer({
-      customer_id: accountId.replace(/-/g, ''),
-      refresh_token: creds.refreshToken,
-      login_customer_id: loginCustomerId ? loginCustomerId.replace(/-/g, '') : undefined,
-    });
+      const customer = client.Customer({
+        customer_id: cleanAccountId,
+        refresh_token: cleanRToken,
+        login_customer_id: cleanLoginId,
+      });
 
-    if (action === 'fetch') {
-      try {
-        // שימוש ב-Query במקום ב-Report לשיפור היציבות
+      if (action === 'fetch') {
         const campaigns = await customer.query(`
           SELECT 
             campaign.id, 
@@ -76,19 +93,22 @@ const platformHandlers = {
           roas: c.metrics.cost_micros > 0 ? c.metrics.conversions_value / (c.metrics.cost_micros / 1000000) : 0,
           updatedAt: new Date().toISOString(),
         }));
-      } catch (err) {
-        console.error("Google Ads Query Error:", err.message);
-        throw err;
       }
-    }
-    
-    if (action === 'status') {
-      const cleanCampaignId = campaignId.replace('live-', '');
-      await customer.campaigns.update([{
-        resource_name: `customers/${accountId.replace(/-/g, '')}/campaigns/${cleanCampaignId}`,
-        status: newStatus === 'Active' ? enums.CampaignStatus.ENABLED : enums.CampaignStatus.PAUSED
-      }]);
-      return { success: true };
+      
+      if (action === 'status') {
+        const cleanCampaignId = campaignId.replace('live-', '');
+        await customer.campaigns.update([{
+          resource_name: `customers/${cleanAccountId}/campaigns/${cleanCampaignId}`,
+          status: newStatus === 'Active' ? enums.CampaignStatus.ENABLED : enums.CampaignStatus.PAUSED
+        }]);
+        return { success: true };
+      }
+    } catch (err) {
+      console.error("!!! [Google API Error]:", err.message);
+      if (err.message.includes('invalid_client')) {
+        console.error("אבחון: ה-Client ID או ה-Secret לא תואמים ל-Refresh Token. וודא שייצרת את ה-Refresh Token בעזרת אותו Client ID בדיוק.");
+      }
+      throw err;
     }
 
     return { success: false };
@@ -106,7 +126,6 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
     const result = await handler(creds, { ...req.body, action });
     res.json(result);
   } catch (error) {
-    console.error(`!!! [Proxy Error] ${platform}:`, error.message);
     res.status(500).json({ 
       error: "API Request Failed", 
       message: error.message

@@ -2,7 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const { GoogleAdsApi } = require('google-ads-api');
+const { GoogleAdsApi, enums } = require('google-ads-api');
 require('dotenv').config();
 
 const app = express();
@@ -19,23 +19,18 @@ app.get('/health', (req, res) => {
 
 const platformHandlers = {
   google: async (creds, body) => {
-    const { action, accountId, campaignId, status: newStatus } = body;
+    const { action, accountId, campaignId, status: newStatus, loginCustomerId } = body;
     
-    // לוגים לדיבאג (אל דאגה, אנחנו לא מדפיסים את המפתחות המלאים)
-    console.log(`[Google Ads] Action: ${action} | Account: ${accountId}`);
-    console.log(`[Auth Check] DeveloperToken: ${!!creds.developerToken}, RefreshToken: ${!!creds.refreshToken}, ClientID: ${!!creds.clientId}, ClientSecret: ${!!creds.clientSecret}`);
+    console.log(`[Google Ads] Action: ${action} | Account: ${accountId} | LoginCID: ${loginCustomerId || 'None'}`);
 
     const finalClientId = creds.clientId || process.env.GOOGLE_CLIENT_ID;
     const finalClientSecret = creds.clientSecret || process.env.GOOGLE_CLIENT_SECRET;
 
-    if (!finalClientId || !finalClientSecret) {
-      throw new Error("Missing Client ID or Client Secret. Please add them in Settings or Render Environment Variables.");
+    if (!finalClientId || !finalClientSecret || !creds.developerToken || !creds.refreshToken) {
+      throw new Error("Missing required credentials (ClientID, Secret, DevToken, or RefreshToken)");
     }
 
-    if (!creds.developerToken || !creds.refreshToken) {
-      throw new Error("Missing Developer Token or Refresh Token.");
-    }
-
+    // יצירת הקליינט עם תמיכה ב-Login Customer ID (קריטי לחשבונות MCC)
     const client = new GoogleAdsApi({
       client_id: finalClientId,
       client_secret: finalClientSecret,
@@ -45,26 +40,33 @@ const platformHandlers = {
     const customer = client.Customer({
       customer_id: accountId.replace(/-/g, ''),
       refresh_token: creds.refreshToken,
+      login_customer_id: loginCustomerId ? loginCustomerId.replace(/-/g, '') : undefined,
     });
 
     if (action === 'fetch') {
       try {
-        const campaigns = await customer.report({
-          entity: 'campaign',
-          attributes: [
-            'campaign.id', 'campaign.name', 'campaign.status',
-            'metrics.cost_micros', 'metrics.conversions', 'metrics.conversions_value',
-            'metrics.clicks', 'metrics.impressions', 'metrics.ctr'
-          ],
-          constraints: [{ 'campaign.status': ['ENABLED', 'PAUSED'] }],
-          limit: 100
-        });
+        // שימוש ב-Query במקום ב-Report לשיפור היציבות
+        const campaigns = await customer.query(`
+          SELECT 
+            campaign.id, 
+            campaign.name, 
+            campaign.status, 
+            metrics.cost_micros, 
+            metrics.conversions, 
+            metrics.conversions_value,
+            metrics.clicks,
+            metrics.impressions,
+            metrics.ctr
+          FROM campaign 
+          WHERE campaign.status IN ('ENABLED', 'PAUSED')
+          LIMIT 100
+        `);
 
         return campaigns.map(c => ({
           id: `live-${c.campaign.id}`,
           name: c.campaign.name,
           platform: 'Google',
-          status: c.campaign.status === 'ENABLED' ? 'Active' : 'Paused',
+          status: c.campaign.status === enums.CampaignStatus.ENABLED ? 'Active' : 'Paused',
           spend: (c.metrics.cost_micros || 0) / 1000000,
           revenue: c.metrics.conversions_value || 0,
           clicks: c.metrics.clicks || 0,
@@ -75,7 +77,7 @@ const platformHandlers = {
           updatedAt: new Date().toISOString(),
         }));
       } catch (err) {
-        console.error("Google Ads API Error Details:", JSON.stringify(err));
+        console.error("Google Ads Query Error:", err.message);
         throw err;
       }
     }
@@ -84,7 +86,7 @@ const platformHandlers = {
       const cleanCampaignId = campaignId.replace('live-', '');
       await customer.campaigns.update([{
         resource_name: `customers/${accountId.replace(/-/g, '')}/campaigns/${cleanCampaignId}`,
-        status: newStatus === 'Active' ? 'ENABLED' : 'PAUSED'
+        status: newStatus === 'Active' ? enums.CampaignStatus.ENABLED : enums.CampaignStatus.PAUSED
       }]);
       return { success: true };
     }
@@ -106,9 +108,8 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
   } catch (error) {
     console.error(`!!! [Proxy Error] ${platform}:`, error.message);
     res.status(500).json({ 
-      error: "Google Ads Authentication Failed", 
-      message: error.message,
-      suggestion: "Check your Client ID, Client Secret, and Refresh Token in Settings."
+      error: "API Request Failed", 
+      message: error.message
     });
   }
 });

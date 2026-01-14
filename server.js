@@ -7,44 +7,38 @@ require('dotenv').config();
 
 const app = express();
 
-// Security and Middleware
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors()); 
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-/**
- * HEALTH CHECK
- */
-app.get('/', (req, res) => {
-  res.send('🚀 Upstep PPC API is running with Live Google Ads Support!');
-});
-
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'online', 
-    timestamp: new Date().toISOString() 
-  });
+  res.json({ status: 'online', timestamp: new Date().toISOString() });
 });
 
-/**
- * PLATFORM PROXY ADAPTERS
- */
 const platformHandlers = {
   google: async (creds, body) => {
     const { action, accountId, campaignId, status: newStatus } = body;
     
+    // לוגים לדיבאג (אל דאגה, אנחנו לא מדפיסים את המפתחות המלאים)
     console.log(`[Google Ads] Action: ${action} | Account: ${accountId}`);
+    console.log(`[Auth Check] DeveloperToken: ${!!creds.developerToken}, RefreshToken: ${!!creds.refreshToken}, ClientID: ${!!creds.clientId}, ClientSecret: ${!!creds.clientSecret}`);
 
-    if (!creds.developerToken || !creds.refreshToken || !accountId) {
-      throw new Error("Missing mandatory Google Ads credentials (Developer Token, Refresh Token, or CID)");
+    const finalClientId = creds.clientId || process.env.GOOGLE_CLIENT_ID;
+    const finalClientSecret = creds.clientSecret || process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!finalClientId || !finalClientSecret) {
+      throw new Error("Missing Client ID or Client Secret. Please add them in Settings or Render Environment Variables.");
     }
 
-    // Initialize Google Ads Client
+    if (!creds.developerToken || !creds.refreshToken) {
+      throw new Error("Missing Developer Token or Refresh Token.");
+    }
+
     const client = new GoogleAdsApi({
-      client_id: creds.clientId || process.env.GOOGLE_CLIENT_ID,
-      client_secret: creds.clientSecret || process.env.GOOGLE_CLIENT_SECRET,
+      client_id: finalClientId,
+      client_secret: finalClientSecret,
       developer_token: creds.developerToken,
     });
 
@@ -55,24 +49,14 @@ const platformHandlers = {
 
     if (action === 'fetch') {
       try {
-        // Fetch campaigns with basic metrics
         const campaigns = await customer.report({
           entity: 'campaign',
           attributes: [
-            'campaign.id',
-            'campaign.name',
-            'campaign.status',
-            'metrics.cost_micros',
-            'metrics.conversions',
-            'metrics.conversions_value',
-            'metrics.clicks',
-            'metrics.impressions',
-            'metrics.ctr',
-            'metrics.average_cpc',
+            'campaign.id', 'campaign.name', 'campaign.status',
+            'metrics.cost_micros', 'metrics.conversions', 'metrics.conversions_value',
+            'metrics.clicks', 'metrics.impressions', 'metrics.ctr'
           ],
-          constraints: [
-            { 'campaign.status': ['ENABLED', 'PAUSED'] }
-          ],
+          constraints: [{ 'campaign.status': ['ENABLED', 'PAUSED'] }],
           limit: 100
         });
 
@@ -87,75 +71,34 @@ const platformHandlers = {
           conversions: c.metrics.conversions || 0,
           impressions: c.metrics.impressions || 0,
           ctr: (c.metrics.ctr || 0) * 100,
-          cpc: (c.metrics.average_cpc || 0) / 1000000,
-          cpa: c.metrics.conversions > 0 ? (c.metrics.cost_micros / 1000000) / c.metrics.conversions : 0,
           roas: c.metrics.cost_micros > 0 ? c.metrics.conversions_value / (c.metrics.cost_micros / 1000000) : 0,
           updatedAt: new Date().toISOString(),
         }));
       } catch (err) {
-        console.error("Google Ads Report Error:", err.message);
-        throw err;
-      }
-    }
-
-    if (action === 'status') {
-      try {
-        const cleanCampaignId = campaignId.replace('live-', '');
-        await customer.campaigns.update([{
-          resource_name: `customers/${accountId.replace(/-/g, '')}/campaigns/${cleanCampaignId}`,
-          status: newStatus === 'Active' ? 'ENABLED' : 'PAUSED'
-        }]);
-        return { success: true, campaignId: cleanCampaignId, newStatus };
-      } catch (err) {
-        console.error("Google Ads Status Update Error:", err.message);
+        console.error("Google Ads API Error Details:", JSON.stringify(err));
         throw err;
       }
     }
     
-    return { success: false, message: 'Unknown action' };
-  },
-  
-  meta: async (creds, body) => {
-    // For Meta, we'll keep simple simulation but labeled as Live if credentials present
-    console.log(`[Meta] Processing ${body.action}`);
-    if (body.action === 'fetch') {
-      return [
-        {
-          id: `live-meta-1`,
-          name: `Meta - Dynamic Advantage+ (LIVE)`,
-          platform: 'Meta',
-          status: 'Active',
-          spend: 850.20,
-          revenue: 3200.00,
-          clicks: 1200,
-          conversions: 28,
-          impressions: 25000,
-          ctr: 4.8,
-          cpc: 0.71,
-          cpa: 30.36,
-          roas: 3.76,
-          updatedAt: new Date().toISOString(),
-        }
-      ];
+    if (action === 'status') {
+      const cleanCampaignId = campaignId.replace('live-', '');
+      await customer.campaigns.update([{
+        resource_name: `customers/${accountId.replace(/-/g, '')}/campaigns/${cleanCampaignId}`,
+        status: newStatus === 'Active' ? 'ENABLED' : 'PAUSED'
+      }]);
+      return { success: true };
     }
-    return { success: true };
+
+    return { success: false };
   }
 };
 
-/**
- * MAIN PROXY ROUTE
- */
 app.post('/api/proxy/:platform/:action', async (req, res) => {
   const { platform, action } = req.params;
-  const { creds, accountId } = req.body;
-
-  console.log(`>>> Incoming Proxy Request: ${platform}/${action}`);
+  const { creds } = req.body;
 
   const handler = platformHandlers[platform.toLowerCase()];
-  
-  if (!handler) {
-    return res.status(404).json({ error: `Platform ${platform} is not supported.` });
-  }
+  if (!handler) return res.status(404).json({ error: 'Platform not supported' });
 
   try {
     const result = await handler(creds, { ...req.body, action });
@@ -163,9 +106,9 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
   } catch (error) {
     console.error(`!!! [Proxy Error] ${platform}:`, error.message);
     res.status(500).json({ 
-      error: "API Error", 
+      error: "Google Ads Authentication Failed", 
       message: error.message,
-      code: error.code || 'INTERNAL_ERROR'
+      suggestion: "Check your Client ID, Client Secret, and Refresh Token in Settings."
     });
   }
 });

@@ -18,41 +18,36 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * מנגנון חילוץ שגיאות אגרסיבי עבור Google Ads API
+ * מנגנון חילוץ שגיאות מתקדם - סורק את כל חלקי השגיאה של גוגל
  */
 const getGoogleError = (error) => {
-  if (!error) return "Unknown error occurred";
+  if (!error) return "שגיאה לא ידועה";
   
-  // הדפסה מפורטת ללוגים של Render (תבדוק אותם ב-Dashboard של Render!)
+  const message = error.message || "";
+  const details = error.details || "";
+  const innerError = (error.response && error.response.data) ? JSON.stringify(error.response.data) : "";
+  
+  // בניית מחרוזת אחת גדולה לסריקה
+  const fullContext = (message + " " + details + " " + innerError + " " + JSON.stringify(error)).toLowerCase();
+
   console.error("--- GOOGLE API ERROR DETECTED ---");
+  console.error("Raw Error Context:", fullContext);
+
+  if (fullContext.includes('invalid_client')) {
+    return "שגיאת Client ID/Secret: גוגל לא מזהה את ה-Client ID או ה-Secret. וודא שהעתקת אותם במדויק מ-Google Cloud Console ללא רווחים ושהם שייכים לאותו פרויקט.";
+  }
   
-  // 1. מבנה שגיאה קלאסי של ספריית google-ads-api
-  if (error.errors && Array.isArray(error.errors) && error.errors.length > 0) {
-    const firstError = error.errors[0];
-    console.error("Detailed Google Error:", JSON.stringify(firstError, null, 2));
-    
-    // ניסיון לחלץ את הקוד הספציפי (למשל DEVELOPER_TOKEN_NOT_APPROVED)
-    const errorCode = firstError.errorCode ? Object.keys(firstError.errorCode)[0] : null;
-    const trigger = firstError.trigger ? ` (Trigger: ${firstError.trigger})` : "";
-    
-    return firstError.message + (errorCode ? ` [Code: ${errorCode}]` : "") + trigger;
+  if (fullContext.includes('invalid_grant')) {
+    return "שגיאת Refresh Token: הטוקן פג תוקף או שאינו תקין. יש להנפיק Refresh Token חדש ב-OAuth Playground.";
   }
 
-  // 2. שגיאת Axios/HTTP (נפוץ ב-Auth)
-  if (error.response && error.response.data) {
-    console.error("HTTP Response Error Data:", JSON.stringify(error.response.data, null, 2));
-    const data = error.response.data;
-    if (data.error_description) return data.error_description;
-    if (data.error && data.error.message) return data.error.message;
-    if (typeof data.error === 'string') return data.error;
+  if (fullContext.includes('developer_token_not_approved')) {
+    return "ה-Developer Token אינו מאושר. השתמש בטוקן מאושר או עבוד מול חשבון Test Ads.";
   }
 
-  // 3. שגיאת gRPC פנימית
-  if (error.details) return error.details;
-
-  // 4. הודעה כללית
-  console.error("Fallback error message:", error.message);
-  return error.message || "An unexpected error occurred without a specific message from Google.";
+  if (error.errors && error.errors[0]) return error.errors[0].message;
+  
+  return message || "חלה שגיאה בתקשורת מול גוגל. בדוק את פרטי החיבור.";
 };
 
 app.post('/api/proxy/:platform/:action', async (req, res) => {
@@ -64,50 +59,42 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
   }
 
   try {
-    if (!creds || !creds.developerToken || !creds.refreshToken || !creds.clientId || !creds.clientSecret) {
-      return res.status(400).json({ error: true, message: "Missing Google Credentials in request body." });
-    }
+    if (!creds) return res.status(400).json({ error: true, message: "Missing credentials" });
+
+    const config = {
+      client_id: (creds.clientId || "").trim(),
+      client_secret: (creds.clientSecret || "").trim(),
+      developer_token: (creds.developerToken || "").trim(),
+    };
 
     const cleanAccountId = accountId ? accountId.toString().replace(/-/g, '').trim() : '';
+    const cleanRefreshToken = (creds.refreshToken || "").trim();
     const cleanLoginId = (loginCustomerId && loginCustomerId.trim() !== "" && loginCustomerId.toLowerCase() !== 'none') 
       ? loginCustomerId.toString().replace(/-/g, '').trim() 
       : undefined;
 
-    const client = new GoogleAdsApi({
-      client_id: creds.clientId.trim(),
-      client_secret: creds.clientSecret.trim(),
-      developer_token: creds.developerToken.trim(),
-    });
-
+    const client = new GoogleAdsApi(config);
     const customer = client.Customer({
       customer_id: cleanAccountId,
-      refresh_token: creds.refreshToken.trim(),
+      refresh_token: cleanRefreshToken,
       login_customer_id: cleanLoginId,
     });
 
     if (action === 'test') {
       try {
-        await customer.query(`SELECT campaign.id FROM campaign LIMIT 1`);
-        return res.json({ success: true, message: "החיבור תקין!" });
+        // ניסיון שליפת שם חשבון כדי לאמת את כל המפתחות
+        await customer.query(`SELECT customer.descriptive_name FROM customer LIMIT 1`);
+        return res.json({ success: true, message: "החיבור תקין ואומת בהצלחה!" });
       } catch (authError) {
-        const msg = getGoogleError(authError);
-        return res.status(401).json({ error: true, message: msg });
+        // החזרת 401 היא קריטית כדי שהדפדפן יציג את ה-JSON שלנו ולא שגיאת מערכת
+        return res.status(401).json({ error: true, message: getGoogleError(authError) });
       }
     }
 
     if (action === 'fetch') {
       try {
         const campaigns = await customer.query(`
-          SELECT 
-            campaign.id, 
-            campaign.name, 
-            campaign.status,
-            metrics.cost_micros,
-            metrics.conversions,
-            metrics.conversions_value,
-            metrics.clicks,
-            metrics.impressions,
-            metrics.ctr
+          SELECT campaign.id, campaign.name, campaign.status, metrics.cost_micros, metrics.conversions, metrics.conversions_value, metrics.clicks, metrics.impressions, metrics.ctr
           FROM campaign
           WHERE campaign.status IN ('ENABLED', 'PAUSED')
           LIMIT 100
@@ -128,7 +115,7 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
           updatedAt: new Date().toISOString(),
         })));
       } catch (fetchError) {
-        return res.status(500).json({ error: true, message: getGoogleError(fetchError) });
+        return res.status(401).json({ error: true, message: getGoogleError(fetchError) });
       }
     }
 
@@ -144,8 +131,7 @@ app.post('/api/proxy/:platform/:action', async (req, res) => {
     res.status(400).json({ error: true, message: 'Invalid action' });
 
   } catch (error) {
-    const errorMsg = getGoogleError(error);
-    res.status(500).json({ error: true, message: errorMsg });
+    res.status(500).json({ error: true, message: getGoogleError(error) });
   }
 });
 
